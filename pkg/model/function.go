@@ -30,5 +30,9 @@ type Instance struct {
 	CreateTimeInMs   int64
 	InitDurationInMs int64
 	Busy             bool
-	LastIdleTime     time.Time
+	LastIdleTime     time.Time // 最后一次结束使用的时候
+	LastAssignTime   time.Time // 最后一次开始使用的时候
+	FirstAssignTime  time.Time // 第一次开始使用的时间
+	ScheduleReqTime  time.Time // 发出调度请求的时间
+	CalTime          time.Time // 最后一次算分时间
 }

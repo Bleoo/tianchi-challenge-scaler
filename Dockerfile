@@ -15,6 +15,7 @@ RUN go build -o scaler cmd/scaler/main.go
 FROM registry.cn-beijing.aliyuncs.com/cloudnative-challenge/ubuntu:latest
 
 # Update the package list and install required packages.
+RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
 RUN apt-get update && apt-get install -y netcat curl
 
 # Set the working directory to /app.
