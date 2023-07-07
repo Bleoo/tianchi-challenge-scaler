@@ -61,9 +61,15 @@ type Simple struct {
 	resourceUsageScore int64   // 资源利用得分
 	coldStartTimeScore int64   // 冷启动得分
 	lastScore          float64 // 上一次的分数
+	lastBt             float64 // 上一次调整方向
 
 	// gc
-	idleDurationBeforeGC float64 // 动态存活时间
+	idleDurationBeforeGC  int64 // 动态存活时间
+	idleCount             int32 // 允许存活量
+	assignCountInInterval int32 // 这一轮的请求量
+	idleCountInInterval   int32 // 这一轮的释放量
+	usingCount            int32 // 执行中的量
+	gcEnabled             bool  // 开启
 }
 
 func New(metaData *model.Meta, config *config.Config) Scaler {
@@ -79,7 +85,8 @@ func New(metaData *model.Meta, config *config.Config) Scaler {
 		wg:                   sync.WaitGroup{},
 		instances:            make(map[string]*model.Instance),
 		idleInstance:         list.New(),
-		idleDurationBeforeGC: config.IdleDurationBeforeGC.Seconds(),
+		idleDurationBeforeGC: int64(config.IdleDurationBeforeGC.Seconds()),
+		gcEnabled:            true,
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
@@ -105,6 +112,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 		instance.Busy = true
 		instance.LastAssignTime = time.Now()
 		s.idleInstance.Remove(element)
+		s.assignCountInInterval++
 		s.mu.Unlock()
 		// log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instance.Id)
 		instanceId = instance.Id
@@ -161,6 +169,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	s.totalSlotTimeInGBs += assignTime.UnixMilli() - initTime.UnixMilli()
 	s.invocationScheduleTimeInSecs += assignTime.UnixMilli() - start.UnixMilli()
 	instance.CalTime = assignTime
+	s.assignCountInInterval++
 	s.mu.Unlock()
 	// log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
 
@@ -216,13 +225,26 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 			return reply, nil
 		}
 		instance.Busy = false
-		s.idleInstance.PushFront(instance)
 		// 计算执行时间
 		gap := start.UnixMilli() - instance.CalTime.UnixMilli()
 		s.totalSlotTimeInGBs += gap
 		s.invocationExecutionTimeInGBs += gap
 		s.invocationExecutionTimeInSecs += gap
+		s.idleCountInInterval++
 		instance.CalTime = start
+		// 近期没有访问就不放了
+		// if s.assignCountInInterval > 0 {
+		s.idleInstance.PushFront(instance)
+		// } else {
+		// 		delete(s.instances, instance.Id)
+		// 		go func() {
+		// 			reason := fmt.Sprintf("Idle duration: %ds", 0)
+		// 			ctx := context.Background()
+		// 			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		// 			defer cancel()
+		// 			s.deleteSlot(ctx, uuid.NewString(), instance.Slot.Id, instance.Id, instance.Meta.Key, reason)
+		// 		}()
+		// 	}
 	} else {
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
 	}
@@ -242,19 +264,23 @@ func (s *Simple) deleteSlot(ctx context.Context, requestId, slotId, instanceId, 
 func (s *Simple) gcLoop() {
 	ticker := time.NewTicker(s.config.GcInterval)
 	for range ticker.C {
+		s.mu.Lock()
+		if !s.gcEnabled {
+			s.mu.Unlock()
+			break
+		}
 		s.CalScore()
+		// var liveCount int32 = 0 // slot 存活占用
 		for {
-			s.mu.Lock()
 			if element := s.idleInstance.Back(); element != nil {
 				instance := element.Value.(*model.Instance)
 				idleDuration := time.Now().Unix() - instance.LastIdleTime.Unix()
-				if float64(idleDuration) > s.idleDurationBeforeGC {
+				if idleDuration > s.idleDurationBeforeGC {
 					//need GC
 					s.idleInstance.Remove(element)
 					delete(s.instances, instance.Id)
-					s.mu.Unlock()
 					go func() {
-						reason := fmt.Sprintf("Idle duration: %fs, excceed configured duration: %.0fs", idleDuration, s.idleDurationBeforeGC)
+						reason := fmt.Sprintf("Idle duration: %ds, excceed configured duration: %ds", idleDuration, s.idleDurationBeforeGC)
 						ctx := context.Background()
 						ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 						defer cancel()
@@ -264,9 +290,9 @@ func (s *Simple) gcLoop() {
 					continue
 				}
 			}
-			s.mu.Unlock()
 			break
 		}
+		s.mu.Unlock()
 	}
 }
 
@@ -281,11 +307,6 @@ func (s *Simple) Stats() Stats {
 
 func (s *Simple) CalScore() {
 	// 计算
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.instances) == 0 {
-		return
-	}
 	now := time.Now()
 	var slotTimeInSecs int64 = 0 // slot 存活占用
 	var execTimeInSecs int64 = 0 // slot 执行占用
@@ -310,12 +331,39 @@ func (s *Simple) CalScore() {
 	log.Printf("app %s score, %.4f, %.4f, %.4f", s.metaData.Key, score, resourceUsageScore, coldStartTimeScore)
 
 	// 调整策略
-	bt := resourceUsageScore / coldStartTimeScore
-	if bt > 1.2 {
-		s.idleDurationBeforeGC *= bt
-	} else if bt < 0.8 {
-		s.idleDurationBeforeGC *= bt
+	// if s.idleDurationBeforeGC <= 240 && s.idleDurationBeforeGC >= 30 {
+	if score > s.lastScore {
+		s.idleDurationBeforeGC = int64(float64(s.idleDurationBeforeGC) * s.lastBt)
+	} else {
+		bt := resourceUsageScore / coldStartTimeScore
+		if bt > 0 && bt <= 0.1 && s.lastBt <= 0.1 {
+			s.gcEnabled = false // 直接极化（摆烂
+			log.Printf("app: %s gc close", s.metaData.Key)
+			return
+		}
+		if bt <= 0.5 {
+			s.idleDurationBeforeGC = int64(float64(s.idleDurationBeforeGC) * bt)
+		} else if bt >= 2 {
+			s.idleDurationBeforeGC = int64(float64(s.idleDurationBeforeGC) * bt)
+		} else {
+			if (bt > 1 && s.lastBt > 1) || (bt < 1 && s.lastBt < 1) {
+				s.idleDurationBeforeGC = int64(float64(s.idleDurationBeforeGC) * (2 - bt))
+			} else {
+				s.idleDurationBeforeGC = int64(float64(s.idleDurationBeforeGC) * bt)
+			}
+		}
+		s.lastBt = bt
 	}
+
+	// if bt > 1 {
+	// 	s.idleDurationBeforeGC = int64(float64(s.idleDurationBeforeGC) * bt)
+	// } else if bt < 0.8 {
+	// 	s.idleDurationBeforeGC = int64(float64(s.idleDurationBeforeGC) * 0.95)
+	// }
+	// }
+	// s.idleCount = s.assignCountInInterval
+	s.assignCountInInterval = 0
+	s.idleCountInInterval = 0
 
 	s.lastScore = score
 }
